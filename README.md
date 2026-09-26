@@ -6,7 +6,8 @@
 declare where a skill lives in `skills.toml`; `skilllock lock` resolves each
 declared ref to a full commit and records a sha256 digest for every file;
 `skilllock sync` fetches those pinned commits and installs them; `skilllock
-verify` checks installed files against the lock without touching the network.
+verify` checks installed files against the lock without touching the network,
+and requires `skills.lock` to exist.
 
 It is deliberately offline-first: **no LLM, no API key, no registry, no
 server.** Retrieval fetches into a throwaway bare repository and reads objects
@@ -81,6 +82,10 @@ records are sorted by UTF-8 path bytes. There is no aggregate tree hash.
 Operational fetch problems (DNS, TLS, timeout, permissions) return `2`.
 Malformed or inconsistent manifest/lock data returns `1`.
 
+A missing `skills.lock` is an operational failure: `verify` exits `2` and asks
+you to run `skilllock lock` first. There is no `--allow-empty` flag or other
+bypass — a successful "verified" exit always means a lockfile was checked.
+
 ## Check IDs
 
 All checks are errors in v0.1.
@@ -101,8 +106,10 @@ All checks are errors in v0.1.
   published them, whether the skill is safe, or whether you should run it.
 - **v0.1 supports Git sources only**, restricted to `https://github.com` URLs.
   There are no transitive dependencies, private registries, or submodules.
-- **`verify` is offline.** It checks installed files against `skills.lock` and
-  never contacts a remote, so it cannot detect upstream changes.
+- **`verify` is offline and requires a lockfile.** It checks installed files
+  against `skills.lock` and never contacts a remote, so it cannot detect
+  upstream changes. If `skills.lock` is missing, `verify` fails with exit code
+  `2` instead of reporting success.
 - **`skilllock` never executes skills.** It fetches, hashes, and copies files.
   It does not run scripts, hooks, installers, or any repository content.
 - `skilllock` is not an LLM-based security scanner and does not answer "is this

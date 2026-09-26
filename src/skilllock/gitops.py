@@ -1,26 +1,28 @@
 """Git retrieval of immutable snapshots without checking out repository code.
 
 We fetch into a throwaway bare repository, read objects with ``git archive``,
-and parse the resulting tar stream ourselves. No working tree is ever created,
-so hooks, smudge filters, and repository scripts never run. Symlinks,
-hardlinks, device nodes, FIFOs, and gitlinks are rejected before any bytes are
-trusted.
+and stream the resulting tar through Python's standard-library ``tarfile``
+reader (``mode="r|"``), consuming one member at a time. No working tree is ever
+created, so hooks, smudge filters, and repository scripts never run. Symlinks,
+hardlinks, device nodes, and FIFOs are rejected by the reader; gitlinks are
+rejected by the separate ``git ls-tree`` pass, because ``git archive`` omits
+them entirely.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+import tarfile
 import tempfile
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from .checks import SL003, SL005, OperationalError, ValidationProblem
 from .hashing import sha256_hex, sort_by_utf8_path
 from .paths import check_case_collisions, validate_relative_path
 
-_BLOCK = 512
 MAX_FILES = 2048
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
@@ -79,6 +81,32 @@ def _run_git(
         raise OperationalError("git executable not found on PATH") from exc
     except OSError as exc:
         raise OperationalError(f"cannot run git: {exc}") from exc
+
+
+def _popen_git(
+    args: list[str], *, env: dict[str, str], cwd: Path | None = None
+) -> subprocess.Popen:
+    try:
+        return subprocess.Popen(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise OperationalError("git executable not found on PATH") from exc
+    except OSError as exc:
+        raise OperationalError(f"cannot run git: {exc}") from exc
+
+
+def _close_quietly(stream: BinaryIO | None) -> None:
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except OSError:  # pragma: no cover - best-effort cleanup
+        pass
 
 
 def _first_line(data: bytes) -> str:
@@ -148,8 +176,7 @@ def fetch_snapshot(
 
         commit = _rev_parse_commit(bare, env)
         _assert_tree_safe(bare, commit, subdir, env)
-        archive = _archive(bare, commit, subdir, env)
-        files = _snapshot_files(archive, subdir)
+        files = _archive_snapshot(bare, commit, subdir, env, source=source)
         skill_md = next((item.data for item in files if item.path == "SKILL.md"), None)
         return Snapshot(commit=commit, files=files, skill_md=skill_md)
 
@@ -191,19 +218,44 @@ def _assert_tree_safe(
             )
 
 
-def _archive(bare: Path, commit: str, subdir: str, env: dict[str, str]) -> bytes:
+def _archive_snapshot(
+    bare: Path,
+    commit: str,
+    subdir: str,
+    env: dict[str, str],
+    *,
+    source: str,
+) -> tuple[SnapshotFile, ...]:
     args = ["archive", "--format=tar", commit]
     if subdir != ".":
         args += ["--", subdir]
-    proc = _run_git(args, env=env, cwd=bare)
-    if proc.returncode != 0:
-        raise ValidationProblem(
-            SL003, f"cannot archive {commit}: {_first_line(proc.stderr)}"
+    process = _popen_git(args, env=env, cwd=bare)
+    evidence: Exception | None = None
+    records: tuple[SnapshotFile, ...] = ()
+    try:
+        records = parse_archive_stream(
+            process.stdout, subdir, source=source, commit=commit
         )
-    return proc.stdout
+    except Exception as exc:
+        evidence = exc
+    finally:
+        _close_quietly(process.stdout)
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        _close_quietly(process.stderr)
+        returncode = process.wait()
+    if returncode != 0:
+        raise ValidationProblem(
+            SL003, f"cannot archive {commit}: {_first_line(stderr)}"
+        )
+    if evidence is not None:
+        raise evidence
+    return records
 
 
-def _strip_subdir(name: str, subdir: str) -> str:
+def _strip_prefix(name: str, subdir: str) -> str:
+    """Strip leading ``./`` and the declared subdir prefix from a member name."""
+    while name.startswith("./"):
+        name = name[2:]
     if subdir == ".":
         return name
     prefix = f"{subdir}/"
@@ -219,174 +271,94 @@ def _strip_subdir(name: str, subdir: str) -> str:
     return relative
 
 
-def _mode_from_perm(perm: int) -> str:
-    return "100755" if perm & 0o111 else "100644"
+def _mode_from_member(member: tarfile.TarInfo) -> str:
+    return "100755" if member.mode & 0o111 else "100644"
 
 
-def _snapshot_files(archive: bytes, subdir: str) -> tuple[SnapshotFile, ...]:
+def _unsupported_kind(member: tarfile.TarInfo) -> str:
+    if member.issym():
+        return "symlink"
+    if member.islnk():
+        return "hardlink"
+    if member.ischr() or member.isblk():
+        return "device node"
+    if member.isfifo():
+        return "FIFO"
+    return "unsupported object"
+
+
+def parse_archive_stream(
+    stream: BinaryIO,
+    subdir: str,
+    *,
+    source: str,
+    commit: str,
+) -> tuple[SnapshotFile, ...]:
+    """Read a ``git archive`` tar stream, one member at a time.
+
+    Directory members are skipped (as in v0.1.0). Every regular-file member is
+    normalized, validated with the shared path validator, and bounded by the
+    file-count and total-size limits before its bytes are read. Members that
+    are not regular files or directories are rejected as ``SL005``.
+
+    Malformed, truncated, or unreadable streams raise ``OperationalError``
+    (exit code 2, no rule ID).
+    """
     records: list[SnapshotFile] = []
     total = 0
-    for name, perm, payload in _iter_tar(archive):
-        relative = _strip_subdir(name, subdir)
-        validate_relative_path(relative)
-        if len(records) >= MAX_FILES:
-            raise ValidationProblem(
-                SL005, f"snapshot exceeds the {MAX_FILES}-file limit"
-            )
-        total += len(payload)
-        if total > MAX_TOTAL_BYTES:
-            raise ValidationProblem(
-                SL005, f"snapshot exceeds the {MAX_TOTAL_BYTES}-byte limit"
-            )
-        records.append(
-            SnapshotFile(
-                path=relative,
-                sha256=sha256_hex(payload),
-                mode=_mode_from_perm(perm),
-                data=payload,
-            )
-        )
+    try:
+        with tarfile.open(fileobj=stream, mode="r|") as archive:
+            for member in archive:
+                if member.isdir():
+                    continue
+                if not member.isfile():
+                    kind = _unsupported_kind(member)
+                    raise ValidationProblem(
+                        SL005, f"archive contains a {kind}: {member.name!r}"
+                    )
+                relative = _strip_prefix(member.name, subdir)
+                validate_relative_path(relative)
+                if len(records) >= MAX_FILES:
+                    raise ValidationProblem(
+                        SL005, f"snapshot exceeds the {MAX_FILES}-file limit"
+                    )
+                size = int(member.size)
+                if size < 0:
+                    raise OperationalError(
+                        f"cannot read archive for {source} at {commit}: "
+                        f"negative size for {member.name!r}"
+                    )
+                total += size
+                if total > MAX_TOTAL_BYTES:
+                    raise ValidationProblem(
+                        SL005, f"snapshot exceeds the {MAX_TOTAL_BYTES}-byte limit"
+                    )
+                handle = archive.extractfile(member)
+                if handle is None:
+                    raise OperationalError(
+                        f"cannot read archive entry {member.name!r} for {source} "
+                        f"at {commit}"
+                    )
+                data = handle.read()
+                if len(data) != size:
+                    raise OperationalError(
+                        f"truncated archive for {source} at {commit}: {member.name!r}"
+                    )
+                records.append(
+                    SnapshotFile(
+                        path=relative,
+                        sha256=sha256_hex(data),
+                        mode=_mode_from_member(member),
+                        data=data,
+                    )
+                )
+    except ValidationProblem:
+        raise
+    except OperationalError:
+        raise
+    except (tarfile.TarError, EOFError, OSError, ValueError) as exc:
+        raise OperationalError(
+            f"cannot read archive for {source} at {commit}: {exc}"
+        ) from exc
     check_case_collisions(item.path for item in records)
     return tuple(sort_by_utf8_path(records))
-
-
-def _parse_octal(field: bytes) -> int:
-    if not field:
-        return 0
-    if field[0] & 0x80:
-        return int.from_bytes(bytes([field[0] & 0x7F]) + field[1:], "big")
-    text = field.split(b"\0", 1)[0].strip()
-    if not text:
-        return 0
-    try:
-        return int(text, 8)
-    except ValueError:
-        return -1
-
-
-def _checksum_ok(header: bytes, stored: int) -> bool:
-    unsigned = sum(header[:148]) + (0x20 * 8) + sum(header[156:])
-    if stored == unsigned:
-        return True
-    signed = (
-        sum(byte - 256 if byte > 127 else byte for byte in header[:148])
-        + (0x20 * 8)
-        + sum(byte - 256 if byte > 127 else byte for byte in header[156:])
-    )
-    return stored == signed
-
-
-def _parse_pax(payload: bytes) -> dict[str, str]:
-    records: dict[str, str] = {}
-    index = 0
-    while index < len(payload):
-        space = payload.find(b" ", index)
-        if space == -1:
-            break
-        try:
-            length = int(payload[index:space])
-        except ValueError:
-            break
-        if length <= 0 or index + length > len(payload):
-            break
-        record = payload[space + 1 : index + length].rstrip(b"\n")
-        key, _, value = record.partition(b"=")
-        try:
-            records[key.decode("utf-8")] = value.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValidationProblem(
-                SL005, "archive metadata is not valid UTF-8"
-            ) from exc
-        index += length
-    return records
-
-
-def _iter_tar(data: bytes) -> Iterator[tuple[str, int, bytes]]:
-    """Yield ``(path, permission_bits, payload)`` for regular files only."""
-    offset = 0
-    total = len(data)
-    pending_path: str | None = None
-    pending_size: int | None = None
-    gnu_name: str | None = None
-    while offset + _BLOCK <= total:
-        header = data[offset : offset + _BLOCK]
-        offset += _BLOCK
-        if header == b"\0" * _BLOCK:
-            return
-        stored_checksum = _parse_octal(header[148:156])
-        if stored_checksum < 0 or not _checksum_ok(header, stored_checksum):
-            raise OperationalError("corrupt tar archive header")
-        raw_size = _parse_octal(header[124:136])
-        if raw_size < 0:
-            raise OperationalError("corrupt tar archive size field")
-        typeflag = header[156:157]
-
-        if typeflag in {b"x", b"g"}:
-            payload = _read_payload(data, offset, raw_size)
-            offset += _padded(raw_size)
-            if typeflag == b"x":
-                pax = _parse_pax(payload)
-                pending_path = pax.get("path", pending_path)
-                if "size" in pax:
-                    try:
-                        pending_size = int(pax["size"])
-                    except ValueError:
-                        pending_size = None
-            continue
-        if typeflag in {b"L", b"K"}:
-            payload = _read_payload(data, offset, raw_size)
-            offset += _padded(raw_size)
-            if typeflag == b"L":
-                gnu_name = payload.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
-            continue
-
-        size = pending_size if pending_size is not None else raw_size
-        payload = _read_payload(data, offset, size)
-        offset += _padded(size)
-        pending_size = None
-
-        if gnu_name is not None:
-            name_bytes = gnu_name.encode("utf-8", "surrogateescape")
-            gnu_name = None
-        else:
-            name_field = header[0:100].split(b"\0", 1)[0]
-            prefix_field = header[345:500].split(b"\0", 1)[0]
-            name_bytes = (
-                f"{prefix_field}/{name_field}".encode() if prefix_field else name_field
-            )
-        if pending_path is not None:
-            name_bytes = pending_path.encode("utf-8")
-            pending_path = None
-        try:
-            name = name_bytes.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValidationProblem(
-                SL005, "archive entry path is not valid UTF-8"
-            ) from exc
-
-        if typeflag in {b"0", b"\0", b""}:
-            yield name, _parse_octal(header[100:108]), payload
-        elif typeflag == b"5":
-            continue
-        elif typeflag == b"2":
-            raise ValidationProblem(SL005, f"archive contains a symlink: {name!r}")
-        elif typeflag == b"1":
-            raise ValidationProblem(SL005, f"archive contains a hardlink: {name!r}")
-        elif typeflag in {b"3", b"4"}:
-            raise ValidationProblem(SL005, f"archive contains a device node: {name!r}")
-        elif typeflag == b"6":
-            raise ValidationProblem(SL005, f"archive contains a FIFO: {name!r}")
-        else:
-            raise ValidationProblem(
-                SL005, f"archive contains an unsupported object: {name!r}"
-            )
-
-
-def _padded(size: int) -> int:
-    return size + ((_BLOCK - (size % _BLOCK)) % _BLOCK)
-
-
-def _read_payload(data: bytes, offset: int, size: int) -> bytes:
-    if size < 0 or offset + size > len(data):
-        raise OperationalError("truncated tar archive")
-    return data[offset : offset + size]

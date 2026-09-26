@@ -55,7 +55,7 @@ jobs:
           # --help succeeds.
           run skilllock --help
 
-          # init + add (no network) + verify on an existing empty target.
+          # init + add (no network), then verify without a lockfile.
           WORK="$(mktemp -d)"
           cd "$WORK"
 
@@ -63,8 +63,16 @@ jobs:
           run skilllock add https://github.com/example/agent-skills.git \
             --name code-review --ref refs/tags/v1.2.0 --subdir skills/code-review
 
+          # A missing skills.lock is an operational failure: exit 2.
           mkdir -p empty
+          set +e
           run skilllock verify --target "$WORK/empty"
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "Expected verify without skills.lock to exit 2; got $status"
+            exit 1
+          fi
 
           # Build manifest, lock, and an installed target without any network.
           run python - "$WORK" <<'PY'
@@ -130,3 +138,36 @@ jobs:
             echo "Expected nonexistent target to exit 2; got $status"
             exit 1
           fi
+
+          # A truncated or garbage archive is an operational failure (exit 2
+          # semantics). This is deterministic and needs no network: it drives
+          # the same reader `lock`/`sync` use and asserts it raises the
+          # OperationalError the CLI maps to exit code 2.
+          run python - <<'PY'
+          import io
+          import tarfile
+
+          from skilllock.checks import OperationalError
+          from skilllock.gitops import parse_archive_stream
+
+          buffer = io.BytesIO()
+          with tarfile.open(fileobj=buffer, mode="w") as archive:
+              info = tarfile.TarInfo("SKILL.md")
+              info.size = 4096
+              archive.addfile(info, io.BytesIO(b"x" * 4096))
+          raw = buffer.getvalue()
+
+          cases = {
+              "truncated": raw[: len(raw) - 3000],
+              "garbage": b"this is not a tar archive" * 64,
+          }
+          for label, payload in cases.items():
+              try:
+                  parse_archive_stream(
+                      io.BytesIO(payload), ".", source="s", commit="c"
+                  )
+              except OperationalError:
+                  print(f"{label}: operational failure as expected")
+              else:
+                  raise SystemExit(f"{label}: expected an OperationalError")
+          PY

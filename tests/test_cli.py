@@ -25,7 +25,7 @@ def test_help_exits_zero() -> None:
 
 def test_version_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["--version"]) == 0
-    assert "0.1.0" in capsys.readouterr().out
+    assert "0.1.1" in capsys.readouterr().out
 
 
 def test_unknown_command_exits_two() -> None:
@@ -80,12 +80,18 @@ def test_verify_missing_target_exits_two() -> None:
     assert cli.main(["verify", "--target", "./does-not-exist"]) == 2
 
 
-def test_verify_empty_target_without_lock_exits_zero(tmp_path: Path) -> None:
+def test_verify_without_lock_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
     assert cli.main(["init"]) == 0
     assert cli.main(["add", SOURCE, "--name", NAME, "--ref", "refs/tags/v1.2.0"]) == 0
-    assert cli.main(["verify", "--target", str(empty)]) == 0
+    capsys.readouterr()
+    assert cli.main(["verify", "--target", str(empty)]) == 2
+    captured = capsys.readouterr()
+    assert "no skills.lock found at" in captured.err
+    assert "run `skilllock lock` first" in captured.err
 
 
 def _craft(tmp_path: Path) -> Path:

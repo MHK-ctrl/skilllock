@@ -1,0 +1,37 @@
+{
+  "captured_from": "skilllock v0.1.0",
+  "subdir": "skills/example-skill",
+  "ref": "refs/tags/v1.0.0",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "sha256": "ce1e7a22cd1fc2de4cf256bb2733e96e958cd640c05f339b8cb2e072b6f8197b",
+      "size": 44
+    },
+    {
+      "path": "empty.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "path": "large.bin",
+      "sha256": "2312394bd99545d9de131c24efb781e765ac1aec243f2ed9347597a793a415e9",
+      "size": 262144
+    },
+    {
+      "path": "name with spaces.txt",
+      "sha256": "cf21451d08380c7662d26ce96a501a2962019272d36c66397d05b54ed6c3a7e6",
+      "size": 33
+    },
+    {
+      "path": "nested/deep/file.txt",
+      "sha256": "54e274cfb7517422ccec200034fd3ac33bde683bb9ae7c729872226f921ae1f2",
+      "size": 15
+    },
+    {
+      "path": "unicode.txt",
+      "sha256": "cf9bff25f2819633152264d97fd375755a712c92171cf1dbd0b6f495b7dd6b85",
+      "size": 28
+    }
+  ]
+}

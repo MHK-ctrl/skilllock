@@ -153,9 +153,11 @@ def verify(
     try:
         target_root = resolve_existing_directory(target)
         lock_path = Path(LOCK_NAME)
-        if not lock_path.exists():
-            print(f"skilllock: no {LOCK_NAME} yet; nothing to verify")
-            return EXIT_OK
+        if not lock_path.is_file():
+            raise OperationalError(
+                f"no {LOCK_NAME} found at {lock_path.resolve()} \u2014 "
+                "run `skilllock lock` first"
+            )
         manifest = load_manifest(Path(MANIFEST_NAME))
         locked = read_lock(lock_path)
         check_agreement(manifest, locked)
