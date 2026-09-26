@@ -48,6 +48,7 @@ jobs:
           set -euo pipefail
           WHEEL="$(find dist -maxdepth 1 -type f -name 'skilllock-*.whl' -print -quit)"
           test -n "$WHEEL"
+          WHEEL="$PWD/$WHEEL"
 
           run() { uv run --isolated --no-project --with "$WHEEL" "$@"; }
 
