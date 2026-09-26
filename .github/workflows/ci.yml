@@ -157,8 +157,10 @@ jobs:
               archive.addfile(info, io.BytesIO(b"x" * 4096))
           raw = buffer.getvalue()
 
+          # Cut inside the member payload: the header is the first 512 bytes,
+          # so 1024 bytes ends part-way through the 4096-byte file.
           cases = {
-              "truncated": raw[: len(raw) - 3000],
+              "truncated": raw[:1024],
               "garbage": b"this is not a tar archive" * 64,
           }
           for label, payload in cases.items():
