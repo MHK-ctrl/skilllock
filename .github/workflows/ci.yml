@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, test, and build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Verify lockfile is current
+        run: uv lock --check
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Check lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Smoke-test built wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          WHEEL="$(find dist -maxdepth 1 -type f -name 'skilllock-*.whl' -print -quit)"
+          test -n "$WHEEL"
+
+          run() { uv run --isolated --no-project --with "$WHEEL" "$@"; }
+
+          # --help succeeds.
+          run skilllock --help
+
+          # init + add (no network) + verify on an existing empty target.
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+
+          run skilllock init
+          run skilllock add https://github.com/example/agent-skills.git \
+            --name code-review --ref refs/tags/v1.2.0 --subdir skills/code-review
+
+          mkdir -p empty
+          run skilllock verify --target "$WORK/empty"
+
+          # Build manifest, lock, and an installed target without any network.
+          run python - "$WORK" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          skill = root / "skills" / "code-review"
+          (skill / "references").mkdir(parents=True)
+          files = {
+              "SKILL.md": b"---\nname: code-review\n---\n# Code review\n",
+              "references/checklist.md": b"- [ ] read the diff\n",
+          }
+          records = []
+          for path, data in files.items():
+              target = skill.joinpath(*path.split("/"))
+              target.write_bytes(data)
+              digest = hashlib.sha256(data).hexdigest()
+              records.append(
+                  f'[[skill.files]]\npath = "{path}"\n'
+                  f'sha256 = "{digest}"\nmode = "100644"\n'
+              )
+          (root / "skills.lock").write_text(
+              'format = 1\n\n[[skill]]\nname = "code-review"\n'
+              'source = "https://github.com/example/agent-skills.git"\n'
+              'ref = "refs/tags/v1.2.0"\nsubdir = "skills/code-review"\n'
+              'commit = "' + "0" * 40 + '"\n\n' + "\n".join(records),
+              encoding="utf-8",
+          )
+          PY
+
+          run skilllock verify --target "$WORK/skills"
+
+          # A deliberately drifted target exits 1.
+          printf 'tampered\n' > "$WORK/skills/code-review/SKILL.md"
+          set +e
+          run skilllock verify --target "$WORK/skills"
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then
+            echo "Expected drift to exit 1; got $status"
+            exit 1
+          fi
+
+          # A missing SKILL.md exits 1.
+          rm "$WORK/skills/code-review/SKILL.md"
+          set +e
+          run skilllock verify --target "$WORK/skills"
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then
+            echo "Expected missing SKILL.md to exit 1; got $status"
+            exit 1
+          fi
+
+          # A nonexistent target path exits 2.
+          set +e
+          run skilllock verify --target "$WORK/does-not-exist"
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "Expected nonexistent target to exit 2; got $status"
+            exit 1
+          fi
